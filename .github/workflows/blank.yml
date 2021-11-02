@@ -1,58 +1,165 @@
-# This is a basic workflow to help you get started with Actions
+name: Continuous Deployment
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the main branch
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    tags:
+      - "v*.*.*"
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
+  generate-changelog:
     name: Generate changelog
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    runs-on: ubuntu-20.04
+    outputs:
+      release_body: ${{ steps.release.outputs.release_body }}
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-        
-        # Runs a single command using the runners shell
-      - name: sas
-        run: echo $GITHUB_WORKSPACE
-        
       - name: Checkout
         uses: actions/checkout@v2
         with:
           fetch-depth: 0
-
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v1
         id: git-cliff
         with:
-          config: cliff.toml
-          args: --verbose
+          config: config/cliff.toml
+          args: -vv --latest --strip header
         env:
-          OUTPUT: CHANGELOG.md
-
-      - name: Print the changelog
-        run: cat "${{ steps.git-cliff.outputs.changelog }}"
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+          OUTPUT: CHANGES.md
+      - name: Set the release body
+        id: release
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          r=$(cat ${{ steps.git-cliff.outputs.changelog }})
+          r="$(printf "$r" | tail -n +3)"
+          r="${r//'%'/'%25'}"
+          r="${r//$'\n'/'%0A'}"
+          r="${r//$'\r'/'%0D'}"
+          echo "::set-output name=release_body::$r"
+  publish-github:
+    name: Publish on GitHub
+    needs: generate-changelog
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        build: [linux-gnu, linux-musl, win-gnu, win-msvc, win32-msvc, macos]
+        include:
+          - BUILD: linux-gnu
+            OS: ubuntu-20.04
+            TOOLCHAIN: stable
+            TARGET: x86_64-unknown-linux-gnu
+          - BUILD: linux-musl
+            OS: ubuntu-20.04
+            TOOLCHAIN: stable
+            TARGET: x86_64-unknown-linux-musl
+          - BUILD: win-gnu
+            OS: windows-2019
+            TOOLCHAIN: stable
+            TARGET: x86_64-pc-windows-gnu
+          - BUILD: win-msvc
+            OS: windows-2019
+            TOOLCHAIN: stable
+            TARGET: x86_64-pc-windows-msvc
+          - BUILD: win32-msvc
+            OS: windows-2019
+            TOOLCHAIN: stable
+            TARGET: i686-pc-windows-msvc
+          - BUILD: macos
+            OS: macos-10.15
+            TOOLCHAIN: stable
+            TARGET: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Set the release version
+        shell: bash
+        run: echo "RELEASE_VERSION=${GITHUB_REF:11}" >> $GITHUB_ENV
+      - name: Install musl-tools
+        if: matrix.TARGET == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            --allow-unauthenticated musl-tools
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.TOOLCHAIN }}
+          target: ${{ matrix.TARGET }}
+          override: true
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.TARGET }}
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release/completions/
+          cp {LICENSE,README.md,CHANGELOG.md} release/
+          OUT_DIR=release/completions/ cargo run --release --bin git-cliff-completions
+          if [ "${{ matrix.OS }}" = "windows-2019" ]; then
+            cp target/${{ matrix.TARGET }}/release/git-cliff.exe release/
+          else
+            cp target/${{ matrix.TARGET }}/release/git-cliff release/
+          fi
+          mv release/ git-cliff-${{ env.RELEASE_VERSION }}/
+      - name: Create release artifacts
+        shell: bash
+        run: |
+          if [ "${{ matrix.OS }}" = "windows-2019" ]; then
+            7z a -tzip "git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}.zip" \
+              git-cliff-${{ env.RELEASE_VERSION }}/
+          else
+            tar -czvf git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}.tar.gz \
+              git-cliff-${{ env.RELEASE_VERSION }}/
+            shasum -a 512 git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}.tar.gz \
+              > git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}.tar.gz.sha512
+          fi
+      - name: Sign the release
+        if: matrix.OS == 'ubuntu-20.04' || matrix.OS == 'macos-10.15'
+        run: |
+          echo "${{ secrets.GPG_RELEASE_KEY }}" | base64 --decode > private.key
+          echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --pinentry-mode=loopback \
+            --passphrase-fd 0 --import private.key
+          echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --pinentry-mode=loopback \
+            --passphrase-fd 0 --detach-sign \
+            git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}.tar.gz
+      - name: Upload the release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: git-cliff-${{ env.RELEASE_VERSION }}-${{ matrix.TARGET }}*
+          file_glob: true
+          overwrite: true
+          tag: ${{ github.ref }}
+          release_name: "Release v${{ env.RELEASE_VERSION }}"
+          body: "${{ needs.generate-changelog.outputs.release_body }}"
+
+  publish-crates-io:
+    name: Publish on crates.io
+    needs: publish-github
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Set the release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF:11}" >> $GITHUB_ENV
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+          override: true
+      - name: Prepare for the crates.io release
+        run: |
+          mkdir git-cliff-core/config/
+          cp config/cliff.toml git-cliff-core/config/
+          sed -i 's|"../config/"|"config/"|' git-cliff-core/src/embed.rs
+      - name: Publish the library
+        run: |
+          cargo publish --allow-dirty --manifest-path git-cliff-core/Cargo.toml \
+            --locked --token ${{ secrets.CARGO_TOKEN }}
+      - name: Wait for library to update
+        shell: bash
+        run: |
+          crate_status="https://raw.githubusercontent.com/rust-lang/crates.io-index/master/gi/t-/git-cliff-core"
+          until curl -s "$crate_status" | grep -q '"vers":"${{ env.RELEASE_VERSION }}"'; do sleep 5; done;
+      - name: Publish the binary
+        run: |
+          cargo publish --allow-dirty --manifest-path git-cliff/Cargo.toml \
+            --locked --token ${{ secrets.CARGO_TOKEN }}
